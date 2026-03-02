@@ -6,6 +6,8 @@ import open3d as o3d
 import open3d.ml as _ml3d
 import open3d.ml.torch as ml3d
 
+DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "randlanet_toronto3d_config.yml")
+
 
 # --------------------------------------------------
 # Download pretrained model if not exists
@@ -21,22 +23,27 @@ def download_weights(ckpt_path):
 # --------------------------------------------------
 # Create Open3D-ML pipeline
 # --------------------------------------------------
-def create_pipeline(device="cpu"):
+def create_pipeline(cfg_file=None, device="cpu"):
 
-    cfg_file = "./randlanet_toronto3d_config.yml"
+    if cfg_file is None:
+        cfg_file = DEFAULT_CONFIG
 
     if not os.path.exists(cfg_file):
         raise FileNotFoundError(
-            "You must download randlanet_toronto3d config.yml "
-            "from Open3D model zoo."
+            f"Config file not found: '{cfg_file}'\n"
+            "Pass the correct path with --config <path/to/config.yml>"
         )
 
     cfg = _ml3d.utils.Config.load_from_file(cfg_file)
 
     model = ml3d.models.RandLANet(**cfg.model)
 
-    # Dummy dataset (required by pipeline)
-    dataset = ml3d.datasets.SemanticKITTI("", **cfg.dataset)
+    # Dummy dataset (required by pipeline).
+    # Pop 'dataset_path' from cfg.dataset to avoid passing it both as a
+    # positional argument and as a keyword argument, which raises TypeError.
+    dataset_cfg = dict(cfg.dataset)
+    dataset_cfg.pop("dataset_path", None)
+    dataset = ml3d.datasets.SemanticKITTI("", **dataset_cfg)
 
     pipeline = ml3d.pipelines.SemanticSegmentation(
         model, dataset=dataset, device=device, **cfg.pipeline
@@ -48,7 +55,7 @@ def create_pipeline(device="cpu"):
 # --------------------------------------------------
 # Process PLY
 # --------------------------------------------------
-def process_ply(ply_path, output_ply, output_labels, device="cpu"):
+def process_ply(ply_path, output_ply, output_labels, cfg_file=None, device="cpu"):
 
     print("Loading PLY...")
     pcd = o3d.io.read_point_cloud(ply_path)
@@ -76,7 +83,7 @@ def process_ply(ply_path, output_ply, output_labels, device="cpu"):
     }
 
     # Create pipeline
-    pipeline = create_pipeline(device=device)
+    pipeline = create_pipeline(cfg_file=cfg_file, device=device)
 
     # Load weights
     ckpt_folder = "./weights"
@@ -119,6 +126,11 @@ if __name__ == "__main__":
     parser.add_argument("--output", default="output.ply", help="Output PLY")
     parser.add_argument("--labels", default="labels.npy", help="Output labels file")
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
+    parser.add_argument(
+        "--config",
+        default=DEFAULT_CONFIG,
+        help="Path to the YAML config file (default: randlanet_toronto3d_config.yml)",
+    )
 
     args = parser.parse_args()
 
@@ -126,5 +138,6 @@ if __name__ == "__main__":
         args.input,
         args.output,
         args.labels,
+        cfg_file=args.config,
         device=args.device
     )
