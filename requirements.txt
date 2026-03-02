@@ -1,0 +1,6 @@
+open3d>=0.18.0
+torch>=2.0.0
+numpy
+pyyaml
+tqdm
+scikit-learn
