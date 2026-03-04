@@ -8,10 +8,6 @@ import open3d.ml.torch as ml3d
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "randlanet_toronto3d_config.yml")
 
-
-# --------------------------------------------------
-# Download pretrained model if not exists
-# --------------------------------------------------
 def download_weights(ckpt_path):
     url = "https://storage.googleapis.com/open3d-releases/model-zoo/randlanet_toronto3d_202201071330utc.pth"
     if not os.path.exists(ckpt_path):
@@ -19,10 +15,6 @@ def download_weights(ckpt_path):
         urllib.request.urlretrieve(url, ckpt_path)
         print("Download complete.")
 
-
-# --------------------------------------------------
-# Create Open3D-ML pipeline
-# --------------------------------------------------
 def create_pipeline(cfg_file=None, device="cpu"):
 
     if cfg_file is None:
@@ -38,9 +30,6 @@ def create_pipeline(cfg_file=None, device="cpu"):
 
     model = ml3d.models.RandLANet(**cfg.model)
 
-    # Dummy dataset (required by pipeline).
-    # Pop 'dataset_path' from cfg.dataset to avoid passing it both as a
-    # positional argument and as a keyword argument, which raises TypeError.
     dataset_cfg = dict(cfg.dataset)
     dataset_cfg.pop("dataset_path", None)
     dataset = ml3d.datasets.SemanticKITTI("", **dataset_cfg)
@@ -51,10 +40,6 @@ def create_pipeline(cfg_file=None, device="cpu"):
 
     return pipeline
 
-
-# --------------------------------------------------
-# Process PLY
-# --------------------------------------------------
 def process_ply(ply_path, output_ply, output_labels, cfg_file=None, device="cpu"):
 
     print("Loading PLY...")
@@ -65,7 +50,6 @@ def process_ply(ply_path, output_ply, output_labels, cfg_file=None, device="cpu"
     if len(points) == 0:
         raise ValueError("Empty point cloud.")
 
-    # Handle colors
     if len(pcd.colors) > 0:
         colors = np.asarray(pcd.colors) * 255.0
     else:
@@ -82,10 +66,8 @@ def process_ply(ply_path, output_ply, output_labels, cfg_file=None, device="cpu"
         "label": np.zeros((num_points,), dtype=np.int32),
     }
 
-    # Create pipeline
     pipeline = create_pipeline(cfg_file=cfg_file, device=device)
 
-    # Load weights
     ckpt_folder = "./weights"
     os.makedirs(ckpt_folder, exist_ok=True)
     ckpt_path = os.path.join(
@@ -101,11 +83,9 @@ def process_ply(ply_path, output_ply, output_labels, cfg_file=None, device="cpu"
 
     predicted_labels = result["predict_labels"]
 
-    # Save labels separately
     np.save(output_labels, predicted_labels)
     print(f"Saved labels to {output_labels}")
 
-    # Colorize output PLY
     max_label = predicted_labels.max()
     norm_labels = predicted_labels / max_label if max_label > 0 else predicted_labels
 
@@ -116,9 +96,6 @@ def process_ply(ply_path, output_ply, output_labels, cfg_file=None, device="cpu"
     print(f"Saved colored PLY to {output_ply}")
 
 
-# --------------------------------------------------
-# Main
-# --------------------------------------------------
 if __name__ == "__main__":
 
     parser = argparse.ArgumentParser()
