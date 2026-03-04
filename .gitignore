@@ -9,3 +9,8 @@ wheels/
 # Virtual environments
 .venv
 *.ply
+
+weights/
+*.pth
+*.npy
+
