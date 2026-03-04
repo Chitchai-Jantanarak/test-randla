@@ -1,28 +1,3 @@
-"""
-apply_labels_to_las.py
-======================
-Takes an input point cloud (LAS or PLY) and the predicted label file (.npy)
-from the RandLANet segmentation script, then writes a LAS 1.2 file with proper
-classification codes that Potree-viewer (and other LAS viewers) can display.
-
-Usage examples
---------------
-  # Basic — PLY input, .npy labels → classified LAS
-  python apply_labels_to_las.py --input cloud.ply --labels labels.npy --output classified.las
-
-  # LAS input
-  python apply_labels_to_las.py --input cloud.las --labels labels.npy --output classified.las
-
-  # Custom label mapping via JSON
-  python apply_labels_to_las.py --input cloud.ply --labels labels.npy --output classified.las \
-      --mapping my_mapping.json
-
-Dependencies
-------------
-  pip install laspy numpy open3d
-  (open3d only needed when the input is PLY)
-"""
-
 import os
 import sys
 import json
@@ -35,45 +10,16 @@ except ImportError:
     sys.exit("laspy is required.  Install with:  pip install laspy")
 
 
-# Toronto3D classes produced by RandLANet:
-#   0  Unclassified
-#   1  Road
-#   2  Road Marking
-#   3  Natural (vegetation)
-#   4  Building
-#   5  Utility Line
-#   6  Pole
-#   7  Car
-#   8  Fence
-#
-# ASPRS standard LAS classification codes:
-#   0  Created / never classified
-#   1  Unclassified
-#   2  Ground
-#   3  Low vegetation
-#   4  Medium vegetation
-#   5  High vegetation
-#   6  Building
-#   7  Low point (noise)
-#   9  Water
-#  11  Road surface
-#  13  Wire – guard
-#  14  Wire – conductor
-#  15  Transmission tower
-#  17  Bridge deck
-#  64+ User-definable
-#
-# Mapping chosen for best Potree/CloudCompare visual compatibility:
+# Model output (0-indexed Toronto3D) → Potree ASPRS class
 DEFAULT_LABEL_MAP = {
-    0: 1,    # Unclassified          → 1  (Unclassified)
-    1: 11,   # Road                  → 11 (Road Surface)
-    2: 11,   # Road Marking          → 11 (Road Surface)  [or use 64 for custom]
-    3: 3,    # Natural / vegetation  → 3  (Low Vegetation)
-    4: 6,    # Building              → 6  (Building)
-    5: 14,   # Utility Line          → 14 (Wire – Conductor)
-    6: 15,   # Pole                  → 15 (Transmission Tower)
-    7: 64,   # Car                   → 64 (User-defined: vehicle)
-    8: 65,   # Fence                 → 65 (User-defined: fence)
+    0: 2,    # Road             → ground          (dark orange)
+    1: 2,    # Road Marking     → ground          (dark orange)
+    2: 5,    # Natural          → high vegetation  (dark green)
+    3: 6,    # Building         → building         (orange)
+    4: 3,    # Utility Line     → low vegetation   (green)
+    5: 8,    # Pole             → key-point        (red)
+    6: 9,    # Car              → water            (blue)
+    7: 7,    # Fence            → low point        (magenta)
 }
 
 
@@ -152,7 +98,7 @@ def write_classified_las(
 
     mins = points.min(axis=0)
     header.offsets = mins
-    header.scales = np.array([0.001, 0.001, 0.001])  # mm precision
+    header.scales = np.array([0.001, 0.001, 0.001])
 
     las = laspy.LasData(header)
     las.x = points[:, 0]
@@ -167,7 +113,6 @@ def write_classified_las(
     las.classification = classification.astype(np.uint8)
 
     las.write(output_path)
-
 
 
 def apply_labels(
@@ -207,7 +152,7 @@ def apply_labels(
             classification[mask] = label_map[model_label]
         else:
             unmapped.add(int(model_label))
-            classification[mask] = 1  
+            classification[mask] = 1
 
     if unmapped:
         print(f"WARNING: labels {unmapped} had no mapping → set to 1 (Unclassified)")
@@ -217,9 +162,8 @@ def apply_labels(
     for c, n in zip(unique_cls, counts):
         print(f"  LAS class {c:3d}  →  {n:>10,} points")
 
-    write_classified_las(output_path, points, colors, classification, source_las)
+    write_classified_las(output_path, points, colors, classification, source_las, use_las14)
     print(f"\nSaved classified LAS to: {output_path}")
-    print("Open this file in Potree-viewer / CloudCompare to see classes.")
 
 
 if __name__ == "__main__":
