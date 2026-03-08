@@ -1,10 +1,19 @@
-# RandLA-Net config — BEV only mode (in_channels=11)
+# RandLA-Net config — dual input mode: 3D + BEV + 2D (in_channels=14)
 #
-# Use when: python main.py --input scan.las --bev
+# Use when: python main.py --input scan.las --bev --footprints buildings.tif --dem ground.tif
 #
 # Channel layout:
-#   xyz (3) + rgb (3) + BEV (5) = 11
-#   BEV: density, height_above_ground, height_range, height_mean, height_std
+#   xyz (3) + rgb (3) + BEV (5) + footprint_mask (1) + ground_elev (1) + height_above_ground (1) = 14
+#
+# For other combinations, adjust in_channels:
+#   3D only (no flags):                          in_channels: 6
+#   3D + BEV (--bev):                            in_channels: 11
+#   3D + 2D (--footprints --dem):                in_channels: 9
+#   3D + 2D (--footprints --dem --dsm):          in_channels: 10
+#   3D + BEV + 2D (--bev --footprints --dem):    in_channels: 14
+#   3D + BEV + 2D (--bev --footprints --dem --dsm): in_channels: 15
+#
+# The main.py script prints expected in_channels at startup — match your config to that.
 
 dataset:
   name: Toronto3D
@@ -38,7 +47,7 @@ model:
   num_classes: 8
   ignored_label_inds: [0]
   sub_sampling_ratio: [4, 4, 4, 4, 2]
-  in_channels: 11
+  in_channels: 14          # 3D(6) + BEV(5) + footprint(1) + DEM(2)
   dim_features: 8
   dim_output: [16, 64, 128, 256, 512]
   grid_size: 0.05

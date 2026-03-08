@@ -2,17 +2,12 @@
 Auto-label generation: project 3D point clouds onto 2D building footprints
 to generate per-point training labels WITHOUT manual annotation.
 
+Uses the shared raster_features module for 2D→3D projection.
+
 Sources for building footprints:
   - OpenStreetMap (good for UK / Europe / urban Thailand)
   - Microsoft Global ML Building Footprints (worldwide)
   - Google Open Buildings (Asia/Africa coverage)
-
-Workflow:
-  1. Load building footprint raster (GeoTIFF binary mask) OR vector (GeoJSON)
-  2. Load DEM/DTM for ground elevation (optional, falls back to percentile)
-  3. For each 3D point: project (x,y) → raster → check if inside building
-  4. Refine with height: above ground + threshold → building, else ground
-  5. Output: per-point labels ready for training
 
 Usage:
   # With a building footprint raster + DEM
@@ -38,6 +33,8 @@ try:
     import laspy
 except ImportError:
     laspy = None
+
+from raster_features import lookup_footprints, load_raster, raster_lookup
 
 # Toronto3D class indices (matching the model)
 CLASS_GROUND = 0
@@ -73,103 +70,6 @@ def load_points(path: str) -> np.ndarray:
 
 
 # ---------------------------------------------------------------------------
-# Raster-based footprint lookup
-# ---------------------------------------------------------------------------
-
-def load_raster_footprints(tif_path: str):
-    """Load a GeoTIFF building mask. Returns (data_2d, transform).
-
-    Expected: single-band raster where pixel > 0 = building.
-    """
-    try:
-        import rasterio
-    except ImportError:
-        sys.exit("rasterio required for GeoTIFF: pip install rasterio")
-
-    with rasterio.open(tif_path) as src:
-        data = src.read(1)
-        transform = src.transform
-        crs = src.crs
-    print(f"Loaded footprint raster: {data.shape}, CRS={crs}")
-    return data, transform
-
-
-def load_dem(tif_path: str):
-    """Load a DEM/DTM GeoTIFF. Returns (data_2d, transform)."""
-    try:
-        import rasterio
-    except ImportError:
-        sys.exit("rasterio required: pip install rasterio")
-
-    with rasterio.open(tif_path) as src:
-        data = src.read(1).astype(np.float64)
-        transform = src.transform
-    print(f"Loaded DEM: {data.shape}, elevation range [{data.min():.1f}, {data.max():.1f}]")
-    return data, transform
-
-
-def raster_lookup(points_xy: np.ndarray, raster: np.ndarray, transform) -> np.ndarray:
-    """For each (x,y), look up the raster value. Returns (N,) array.
-
-    Points outside raster bounds get value 0.
-    """
-    import rasterio.transform
-
-    rows, cols = rasterio.transform.rowcol(transform, points_xy[:, 0], points_xy[:, 1])
-    rows = np.asarray(rows, dtype=np.int64)
-    cols = np.asarray(cols, dtype=np.int64)
-
-    h, w = raster.shape
-    valid = (rows >= 0) & (rows < h) & (cols >= 0) & (cols < w)
-
-    result = np.zeros(len(points_xy), dtype=raster.dtype)
-    result[valid] = raster[rows[valid], cols[valid]]
-    return result
-
-
-# ---------------------------------------------------------------------------
-# Vector-based footprint lookup (GeoJSON/Shapefile)
-# ---------------------------------------------------------------------------
-
-def vector_footprint_lookup(points_xy: np.ndarray, vector_path: str) -> np.ndarray:
-    """Check which points fall inside building polygons from a vector file.
-
-    Returns (N,) bool array.
-    """
-    try:
-        import geopandas as gpd
-        from shapely.geometry import Point
-        from shapely.strtree import STRtree
-    except ImportError:
-        sys.exit("geopandas + shapely required: pip install geopandas shapely")
-
-    gdf = gpd.read_file(vector_path)
-    print(f"Loaded {len(gdf)} building polygons from {vector_path}")
-
-    # build spatial index
-    tree = STRtree(gdf.geometry.values)
-    inside = np.zeros(len(points_xy), dtype=bool)
-
-    # batch query: for each point, check if inside any polygon
-    # process in chunks to manage memory
-    chunk_size = 100_000
-    for start in range(0, len(points_xy), chunk_size):
-        end = min(start + chunk_size, len(points_xy))
-        for i in range(start, end):
-            pt = Point(points_xy[i, 0], points_xy[i, 1])
-            candidates = tree.query(pt)
-            for geom in candidates:
-                if geom.contains(pt):
-                    inside[i] = True
-                    break
-
-        if (start // chunk_size) % 10 == 0:
-            print(f"  Vector lookup: {end:,}/{len(points_xy):,} points checked")
-
-    return inside
-
-
-# ---------------------------------------------------------------------------
 # Label generation
 # ---------------------------------------------------------------------------
 
@@ -187,7 +87,6 @@ def generate_auto_labels(
         footprint_path: GeoTIFF raster (.tif) or vector (.geojson/.shp/.gpkg)
         dem_path: optional DEM GeoTIFF for ground elevation
         min_building_height: min height above ground to count as building
-        default_class: label for non-building points
 
     Returns:
         labels: (N,) int32 array with Toronto3D class indices
@@ -195,50 +94,38 @@ def generate_auto_labels(
     n = len(points)
     labels = np.full(n, default_class, dtype=np.int32)
     xy = points[:, :2]
-    z = points[:, 2]
+    z = points[:, 2].astype(np.float64)
 
-    # --- determine which points are inside building footprints ---
-    ext = os.path.splitext(footprint_path)[1].lower()
-
-    if ext in (".tif", ".tiff"):
-        raster, transform = load_raster_footprints(footprint_path)
-        footprint_values = raster_lookup(xy, raster, transform)
-        inside_building = footprint_values > 0
-    elif ext in (".geojson", ".json", ".shp", ".gpkg"):
-        inside_building = vector_footprint_lookup(xy, footprint_path)
-    else:
-        sys.exit(f"Unsupported footprint format: {ext}")
-
+    # --- footprint lookup (uses shared module) ---
+    inside_building = lookup_footprints(xy, footprint_path)
     print(f"Points inside building footprints: {inside_building.sum():,} / {n:,}")
 
-    # --- get ground elevation ---
+    # --- ground elevation ---
     if dem_path is not None:
-        dem_raster, dem_transform = load_dem(dem_path)
-        ground_z = raster_lookup(xy, dem_raster, dem_transform).astype(np.float64)
-        # fallback for points outside DEM coverage
-        no_dem = ground_z == 0
-        if no_dem.any():
-            ground_z[no_dem] = np.percentile(z, 5)
+        dem_raster, dem_transform, _ = load_raster(dem_path)
+        ground_z = raster_lookup(xy, dem_raster, dem_transform)
+        no_coverage = ground_z == 0
+        if no_coverage.any():
+            ground_z[no_coverage] = np.percentile(z, 5)
     else:
-        # simple fallback: ground = low percentile of z
         ground_z = np.full(n, np.percentile(z, 5))
 
     height_above_ground = z - ground_z
 
     # --- assign labels ---
-    # building: inside footprint AND sufficiently above ground
+    # building: inside footprint AND above ground
     is_building = inside_building & (height_above_ground > min_building_height)
     labels[is_building] = CLASS_BUILDING
 
-    # ground: inside footprint but AT ground level (footprint shadow)
+    # ground: inside footprint but at ground level (footprint shadow)
     is_ground_in_fp = inside_building & (height_above_ground <= min_building_height)
     labels[is_ground_in_fp] = CLASS_GROUND
 
-    # vegetation: outside footprint AND high above ground
+    # vegetation: outside footprint AND high
     is_veg = ~inside_building & (height_above_ground > min_building_height)
     labels[is_veg] = CLASS_VEGETATION
 
-    # ground: outside footprint AND at ground level
+    # ground: outside footprint AND low
     is_ground = ~inside_building & (height_above_ground <= min_building_height)
     labels[is_ground] = CLASS_GROUND
 

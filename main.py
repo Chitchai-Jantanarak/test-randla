@@ -1,8 +1,35 @@
 """
-RandLA-Net semantic segmentation inference with:
-  - Batch/chunked processing for extremely large LAS/PLY files (150-300 GB)
-  - Optional BEV (Bird's Eye View) feature injection
-  - LAS native input support alongside PLY
+RandLA-Net semantic segmentation inference.
+
+Supports three input modes:
+  1. 3D only      — point cloud (PLY/LAS) with RGB
+  2. 3D + BEV     — adds self-computed BEV features from point cloud
+  3. 3D + 2D      — adds raster-projected features (footprints, DEM, DSM)
+  4. 3D + BEV + 2D — all combined (maximum context)
+
+When 2D data is available it gets projected onto points as extra feature
+channels. When not available, falls back gracefully to 3D-only.
+
+Handles extremely large files (150-300 GB LAS) via chunked processing.
+
+Usage examples:
+  # 3D only (original behavior)
+  python main.py --input scan.las --labels out.npy
+
+  # 3D + BEV features
+  python main.py --input scan.las --labels out.npy --bev
+
+  # 3D + 2D (dual input — footprints + DEM)
+  python main.py --input scan.las --labels out.npy \\
+      --footprints buildings.tif --dem ground.tif
+
+  # 3D + BEV + 2D (full stack)
+  python main.py --input scan.las --labels out.npy --bev \\
+      --footprints buildings.tif --dem ground.tif --dsm surface.tif
+
+  # Large file with chunked processing
+  python main.py --input huge.las --labels out.npy --chunk-size 5000000 \\
+      --footprints buildings.tif --dem ground.tif
 """
 
 import os
@@ -21,6 +48,7 @@ import open3d.ml as _ml3d
 import open3d.ml.torch as ml3d
 
 from bev_features import compute_bev_features, compute_bev_features_chunked
+from raster_features import compute_raster_features
 
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "randlanet_toronto3d_config.yml")
 WEIGHTS_URL = "https://storage.googleapis.com/open3d-releases/model-zoo/randlanet_toronto3d_202201071330utc.pth"
@@ -67,11 +95,10 @@ def create_pipeline(cfg_file: str | None = None, device: str = "cpu"):
 
 
 # ---------------------------------------------------------------------------
-# Point cloud I/O (supports PLY and LAS/LAZ)
+# Point cloud I/O
 # ---------------------------------------------------------------------------
 
 def read_pointcloud_ply(path: str):
-    """Read a PLY file, return (points, colors) as numpy arrays."""
     pcd = o3d.io.read_point_cloud(path)
     points = np.asarray(pcd.points)
     colors = np.asarray(pcd.colors) * 255.0 if len(pcd.colors) > 0 else np.zeros_like(points)
@@ -79,11 +106,6 @@ def read_pointcloud_ply(path: str):
 
 
 def iter_las_chunks(path: str, chunk_size: int = 5_000_000):
-    """Yield (points, colors) chunks from a LAS/LAZ file without loading it all.
-
-    Each chunk is at most ``chunk_size`` points.  This keeps RAM bounded even
-    for 150-300 GB files.
-    """
     if laspy is None:
         sys.exit("laspy is required for LAS/LAZ files.  pip install laspy")
 
@@ -105,8 +127,6 @@ def iter_las_chunks(path: str, chunk_size: int = 5_000_000):
 
 
 def read_pointcloud(path: str, chunk_size: int = 0):
-    """Unified reader.  If chunk_size > 0 and the file is LAS/LAZ, yields chunks.
-    Otherwise returns full arrays."""
     ext = os.path.splitext(path)[1].lower()
 
     if ext == ".ply":
@@ -116,7 +136,6 @@ def read_pointcloud(path: str, chunk_size: int = 0):
     elif ext in (".las", ".laz"):
         if chunk_size > 0:
             return iter_las_chunks(path, chunk_size)
-        # load entire file
         if laspy is None:
             sys.exit("laspy is required.  pip install laspy")
         las = laspy.read(path)
@@ -134,6 +153,49 @@ def read_pointcloud(path: str, chunk_size: int = 0):
 
 
 # ---------------------------------------------------------------------------
+# Feature assembly — combines RGB + BEV + 2D raster into one feat array
+# ---------------------------------------------------------------------------
+
+def build_features(
+    points: np.ndarray,
+    colors: np.ndarray,
+    use_bev: bool = False,
+    bev_cell_size: float = 1.0,
+    footprint_path: str | None = None,
+    dem_path: str | None = None,
+    dsm_path: str | None = None,
+) -> np.ndarray:
+    """Assemble the full per-point feature vector.
+
+    Channel layout (concatenated left to right):
+      [RGB (3)] + [BEV (5) if --bev] + [2D raster (1-4) if --footprints/--dem/--dsm]
+
+    Returns: (N, C) float32
+    """
+    parts = [colors]
+
+    # BEV features from point cloud itself
+    if use_bev:
+        bev = compute_bev_features(points, cell_size=bev_cell_size)
+        parts.append(bev)
+
+    # 2D raster features (only when available)
+    has_2d = any(p is not None for p in [footprint_path, dem_path, dsm_path])
+    if has_2d:
+        raster_feats, raster_names = compute_raster_features(
+            points,
+            footprint_path=footprint_path,
+            dem_path=dem_path,
+            dsm_path=dsm_path,
+        )
+        if raster_feats.shape[1] > 0:
+            parts.append(raster_feats)
+
+    feat = np.hstack(parts).astype(np.float32)
+    return feat
+
+
+# ---------------------------------------------------------------------------
 # Inference (single chunk)
 # ---------------------------------------------------------------------------
 
@@ -143,19 +205,25 @@ def infer_chunk(
     colors: np.ndarray,
     use_bev: bool = False,
     bev_cell_size: float = 1.0,
+    footprint_path: str | None = None,
+    dem_path: str | None = None,
+    dsm_path: str | None = None,
 ) -> np.ndarray:
-    """Run segmentation on one chunk of points.  Returns predicted labels."""
+    """Run segmentation on one chunk. Returns predicted labels."""
 
-    feat = colors.copy()
-
-    if use_bev:
-        bev = compute_bev_features(points, cell_size=bev_cell_size)
-        feat = np.hstack([feat, bev])
+    feat = build_features(
+        points, colors,
+        use_bev=use_bev,
+        bev_cell_size=bev_cell_size,
+        footprint_path=footprint_path,
+        dem_path=dem_path,
+        dsm_path=dsm_path,
+    )
 
     data = {
         "name": "chunk",
         "point": points.astype(np.float32),
-        "feat": feat.astype(np.float32),
+        "feat": feat,
         "label": np.zeros(len(points), dtype=np.int32),
     }
 
@@ -164,8 +232,27 @@ def infer_chunk(
 
 
 # ---------------------------------------------------------------------------
-# Main entry: batch-aware inference
+# Main entry
 # ---------------------------------------------------------------------------
+
+def count_feature_channels(
+    use_bev: bool,
+    footprint_path: str | None,
+    dem_path: str | None,
+    dsm_path: str | None,
+) -> int:
+    """Calculate expected in_channels so user knows which config to use."""
+    c = 6  # xyz (3) + rgb (3) — Open3D-ML convention
+    if use_bev:
+        c += 5
+    if footprint_path:
+        c += 1  # footprint_mask
+    if dem_path:
+        c += 2  # ground_elevation + height_above_ground
+    if dsm_path:
+        c += 1  # surface_elevation
+    return c
+
 
 def process_pointcloud(
     input_path: str,
@@ -176,20 +263,26 @@ def process_pointcloud(
     chunk_size: int = 0,
     use_bev: bool = False,
     bev_cell_size: float = 1.0,
+    footprint_path: str | None = None,
+    dem_path: str | None = None,
+    dsm_path: str | None = None,
 ):
-    """Run segmentation, writing labels to .npy (and optionally a colored PLY).
+    # report input mode
+    mode_parts = ["3D"]
+    if use_bev:
+        mode_parts.append("BEV")
+    if any(p is not None for p in [footprint_path, dem_path, dsm_path]):
+        mode_parts.append("2D")
+    expected_ch = count_feature_channels(use_bev, footprint_path, dem_path, dsm_path)
+    print(f"Input mode: {' + '.join(mode_parts)}  (expected in_channels={expected_ch})")
 
-    For very large files set ``chunk_size`` > 0 to process in batches.
-    Labels from all chunks are concatenated in file order.
-    """
-
-    # ---- pipeline & weights ----
+    # pipeline & weights
     pipeline = create_pipeline(cfg_file=cfg_file, device=device)
     ckpt_path = os.path.join(WEIGHTS_DIR, "randlanet_toronto3d_202201071330utc.pth")
     download_weights(ckpt_path)
     pipeline.load_ckpt(ckpt_path=ckpt_path)
 
-    # ---- read & infer ----
+    # read & infer
     all_labels = []
     all_points = [] if output_ply else None
     total_points = 0
@@ -201,7 +294,14 @@ def process_pointcloud(
         total_points += n
         print(f"  chunk {idx}: {n:,} points  (cumulative {total_points:,})")
 
-        labels = infer_chunk(pipeline, pts, colors, use_bev=use_bev, bev_cell_size=bev_cell_size)
+        labels = infer_chunk(
+            pipeline, pts, colors,
+            use_bev=use_bev,
+            bev_cell_size=bev_cell_size,
+            footprint_path=footprint_path,
+            dem_path=dem_path,
+            dsm_path=dsm_path,
+        )
         all_labels.append(labels)
 
         if all_points is not None:
@@ -210,11 +310,11 @@ def process_pointcloud(
     all_labels = np.concatenate(all_labels)
     print(f"Inference done: {len(all_labels):,} points total")
 
-    # ---- save labels ----
+    # save labels
     np.save(output_labels, all_labels)
     print(f"Saved labels → {output_labels}")
 
-    # ---- optional colored PLY ----
+    # optional colored PLY
     if output_ply:
         all_pts = np.concatenate(all_points)
         pcd = o3d.geometry.PointCloud()
@@ -234,20 +334,35 @@ def process_pointcloud(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="RandLA-Net inference with batch support for large LAS/PLY files"
+        description="RandLA-Net inference: 3D-only, 3D+BEV, 3D+2D, or 3D+BEV+2D"
     )
-    parser.add_argument("--input", required=True, help="Input point cloud (.ply, .las, .laz)")
-    parser.add_argument("--labels", default="labels.npy", help="Output labels .npy path")
-    parser.add_argument("--output", default=None, help="Optional output colored PLY")
+
+    # required
+    parser.add_argument("--input", required=True, help="Input point cloud (.ply/.las/.laz)")
+    parser.add_argument("--labels", default="labels.npy", help="Output labels .npy")
+
+    # optional outputs
+    parser.add_argument("--output", default=None, help="Optional colored PLY output")
+
+    # model
     parser.add_argument("--config", default=DEFAULT_CONFIG, help="YAML config path")
     parser.add_argument("--device", default="cpu", help="cpu or cuda")
-    parser.add_argument(
-        "--chunk-size", type=int, default=0,
-        help="Points per chunk for large LAS files (0 = load all at once). "
-             "Recommended: 5000000 for large files."
-    )
+
+    # batching
+    parser.add_argument("--chunk-size", type=int, default=0,
+                        help="Points per chunk for large files (0=all). Recommended: 5000000")
+
+    # BEV features (computed from 3D points)
     parser.add_argument("--bev", action="store_true", help="Enable BEV feature injection")
     parser.add_argument("--bev-cell-size", type=float, default=1.0, help="BEV grid cell size (meters)")
+
+    # 2D raster inputs (optional — dual input mode)
+    parser.add_argument("--footprints", default=None,
+                        help="Building footprints: GeoTIFF (.tif) or vector (.geojson/.shp/.gpkg)")
+    parser.add_argument("--dem", default=None,
+                        help="DEM/DTM GeoTIFF for ground elevation")
+    parser.add_argument("--dsm", default=None,
+                        help="DSM GeoTIFF for surface elevation")
 
     args = parser.parse_args()
 
@@ -260,4 +375,7 @@ if __name__ == "__main__":
         chunk_size=args.chunk_size,
         use_bev=args.bev,
         bev_cell_size=args.bev_cell_size,
+        footprint_path=args.footprints,
+        dem_path=args.dem,
+        dsm_path=args.dsm,
     )
