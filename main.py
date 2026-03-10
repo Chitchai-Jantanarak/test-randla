@@ -43,6 +43,7 @@ try:
 except ImportError:
     laspy = None
 
+import torch
 import open3d as o3d
 import open3d.ml as _ml3d
 import open3d.ml.torch as ml3d
@@ -53,6 +54,9 @@ from raster_features import compute_raster_features
 DEFAULT_CONFIG = os.path.join(os.path.dirname(__file__), "randlanet_toronto3d_config.yml")
 WEIGHTS_URL = "https://storage.googleapis.com/open3d-releases/model-zoo/randlanet_toronto3d_202201071330utc.pth"
 WEIGHTS_DIR = os.path.join(os.path.dirname(__file__), "weights")
+
+# Pretrained checkpoint was trained with 6 input channels (xyz + rgb).
+PRETRAINED_IN_CHANNELS = 6
 
 
 # ---------------------------------------------------------------------------
@@ -65,6 +69,130 @@ def download_weights(ckpt_path: str):
         os.makedirs(os.path.dirname(ckpt_path), exist_ok=True)
         urllib.request.urlretrieve(WEIGHTS_URL, ckpt_path)
         print("Download complete.")
+
+
+# ---------------------------------------------------------------------------
+# Freeze + Extend: adapt pretrained weights for extra input channels
+# ---------------------------------------------------------------------------
+# Open3D-ML RandLANet first layer: fc0 = nn.Linear(in_channels, dim_features)
+# Checkpoint has fc0.weight (dim_features, 6) and fc0.bias (dim_features,).
+#
+# Strategy:
+#   - Keep the first 6 columns of fc0.weight (pretrained RGB knowledge)
+#   - Append new columns for BEV / 2D channels, initialized with Xavier
+#   - Bias stays unchanged (same output dim)
+#   - All other layers are untouched (they don't depend on in_channels)
+
+# Keys in the Open3D-ML RandLANet checkpoint that depend on in_channels.
+# fc0 is the input projection layer: nn.Linear(in_channels, dim_features).
+# In the saved state_dict these appear as:
+#   fc0.weight  →  shape (dim_features, in_channels)
+#   fc0.bias    →  shape (dim_features,)
+#
+# Additionally, the first encoder's local spatial encoding (fc_encoder_0)
+# contains a sub-layer whose weight has shape (*, 2 * in_channels) because
+# RandLA-Net concatenates [point_features, relative_position_features].
+# We handle both cases by scanning for any weight whose last dimension
+# equals PRETRAINED_IN_CHANNELS.
+
+def extend_checkpoint(
+    ckpt_path: str,
+    target_in_channels: int,
+    device: str = "cpu",
+) -> dict:
+    """Load pretrained checkpoint and extend fc0 weights for more channels.
+
+    Returns the modified state_dict ready for model.load_state_dict().
+
+    Mode 1 (6 ch): returns original weights unchanged.
+    Mode 2 (11 ch): extends fc0 by 5 columns for BEV.
+    Mode 3 (9 ch): extends fc0 by 3 columns for 2D raster.
+    Mode 4 (14 ch): extends fc0 by 8 columns for BEV + 2D.
+    """
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+
+    # Open3D-ML checkpoints may wrap state_dict under various keys
+    if isinstance(ckpt, dict):
+        if "model_state_dict" in ckpt:
+            state_dict = ckpt["model_state_dict"]
+        elif "state_dict" in ckpt:
+            state_dict = ckpt["state_dict"]
+        else:
+            state_dict = ckpt
+    else:
+        state_dict = ckpt
+
+    if target_in_channels == PRETRAINED_IN_CHANNELS:
+        print(f"  Weights: using original checkpoint (in_channels={PRETRAINED_IN_CHANNELS})")
+        return state_dict
+
+    extra = target_in_channels - PRETRAINED_IN_CHANNELS
+    print(f"  Weights: Freeze+Extend fc0 from {PRETRAINED_IN_CHANNELS} → {target_in_channels} "
+          f"(+{extra} channels)")
+
+    extended_state_dict = {}
+    for key, tensor in state_dict.items():
+        if tensor.dim() < 2:
+            # bias or 1D param — keep as-is
+            extended_state_dict[key] = tensor
+            continue
+
+        # Check if the last dimension matches pretrained in_channels
+        # fc0.weight has shape (dim_features, in_channels)
+        last_dim = tensor.shape[-1]
+
+        if last_dim == PRETRAINED_IN_CHANNELS:
+            # This is fc0.weight or similar — extend it
+            new_shape = list(tensor.shape)
+            new_shape[-1] = target_in_channels
+            extended = torch.zeros(new_shape, dtype=tensor.dtype, device=tensor.device)
+
+            # Copy pretrained weights for first 6 channels
+            extended[..., :PRETRAINED_IN_CHANNELS] = tensor
+
+            # Xavier init for new channels
+            fan_in = target_in_channels
+            fan_out = tensor.shape[0] if tensor.dim() == 2 else tensor.shape[-2]
+            std = (2.0 / (fan_in + fan_out)) ** 0.5
+            torch.nn.init.normal_(extended[..., PRETRAINED_IN_CHANNELS:], mean=0.0, std=std)
+
+            extended_state_dict[key] = extended
+            print(f"    Extended: {key}  {list(tensor.shape)} → {list(extended.shape)}")
+
+        elif last_dim == 2 * PRETRAINED_IN_CHANNELS:
+            # RandLA-Net local spatial encoding concatenates features:
+            # [d_features || relative_position] where relative_position = 2*in_channels
+            new_last = 2 * target_in_channels
+            new_shape = list(tensor.shape)
+            new_shape[-1] = new_last
+            extended = torch.zeros(new_shape, dtype=tensor.dtype, device=tensor.device)
+            extended[..., :2 * PRETRAINED_IN_CHANNELS] = tensor
+
+            fan_in = new_last
+            fan_out = tensor.shape[0] if tensor.dim() == 2 else tensor.shape[-2]
+            std = (2.0 / (fan_in + fan_out)) ** 0.5
+            torch.nn.init.normal_(extended[..., 2 * PRETRAINED_IN_CHANNELS:], mean=0.0, std=std)
+
+            extended_state_dict[key] = extended
+            print(f"    Extended: {key}  {list(tensor.shape)} → {list(extended.shape)}")
+
+        else:
+            # Doesn't depend on in_channels — keep unchanged
+            extended_state_dict[key] = tensor
+
+    return extended_state_dict
+
+
+def load_weights_extended(pipeline, ckpt_path: str, target_in_channels: int, device: str = "cpu"):
+    """Load checkpoint into pipeline, extending weights if needed."""
+    if target_in_channels == PRETRAINED_IN_CHANNELS:
+        # Mode 1: original 6-channel — use standard loading
+        pipeline.load_ckpt(ckpt_path=ckpt_path)
+    else:
+        # Mode 2/3/4: extended channels — manual weight surgery
+        extended_sd = extend_checkpoint(ckpt_path, target_in_channels, device=device)
+        pipeline.model.load_state_dict(extended_sd, strict=False)
+        print(f"  Loaded extended weights into model (strict=False)")
 
 
 # ---------------------------------------------------------------------------
@@ -276,11 +404,11 @@ def process_pointcloud(
     expected_ch = count_feature_channels(use_bev, footprint_path, dem_path, dsm_path)
     print(f"Input mode: {' + '.join(mode_parts)}  (expected in_channels={expected_ch})")
 
-    # pipeline & weights
+    # pipeline & weights (Freeze+Extend for extra channels)
     pipeline = create_pipeline(cfg_file=cfg_file, device=device)
     ckpt_path = os.path.join(WEIGHTS_DIR, "randlanet_toronto3d_202201071330utc.pth")
     download_weights(ckpt_path)
-    pipeline.load_ckpt(ckpt_path=ckpt_path)
+    load_weights_extended(pipeline, ckpt_path, expected_ch, device=device)
 
     # read & infer
     all_labels = []
