@@ -1,10 +1,11 @@
-# RandLA-Net config — BEV only mode (in_channels=11)
+# RandLA-Net config — BEV only mode (in_channels=13)
 #
 # Use when: python main.py --input scan.las --bev
 #
 # Channel layout:
-#   xyz (3) + rgb (3) + BEV (5) = 11
-#   BEV: density, height_above_ground, height_range, height_mean, height_std
+#   xyz (3) + rgb (3) + BEV (7) = 13
+#   BEV: density, height_above_ground, height_range, height_mean, height_std,
+#        z_normalized, height_rank
 
 dataset:
   name: Toronto3D
@@ -38,7 +39,7 @@ model:
   num_classes: 8
   ignored_label_inds: [0]
   sub_sampling_ratio: [4, 4, 4, 4, 2]
-  in_channels: 11
+  in_channels: 13
   dim_features: 8
   dim_output: [16, 64, 128, 256, 512]
   grid_size: 0.05

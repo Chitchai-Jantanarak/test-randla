@@ -6,12 +6,16 @@ These features help the model understand xy-layout information that pure 3D loca
 neighborhoods miss — critical for separating adjacent buildings and filtering
 vegetation-on-roof confusion.
 
-BEV features per point (5 channels):
-  - point_density:      number of points in the xy cell (log-scaled)
+BEV features per point (7 channels):
+  - point_density:       number of points in the xy cell (log-scaled)
   - height_above_ground: z - z_min in the cell
   - height_range:        z_max - z_min in the cell
   - height_mean:         mean z in the cell
   - height_std:          std of z in the cell
+  - z_normalized:        global height (z - z_min) / (z_max - z_min), 0→1
+                         separates water (~0) from rooftops (~0.8+)
+  - height_rank:         position within cell's vertical column (0→1)
+                         walls span full range, roofs cluster near 1.0
 """
 
 import numpy as np
@@ -29,7 +33,7 @@ def compute_bev_features(
         cell_size: resolution of the BEV grid in the same unit as the point cloud.
 
     Returns:
-        bev_feats: (N, 5) float32 array of BEV features per point.
+        bev_feats: (N, 7) float32 array of BEV features per point.
     """
     xyz = points[:, :3].astype(np.float64)
     x, y, z = xyz[:, 0], xyz[:, 1], xyz[:, 2]
@@ -80,12 +84,32 @@ def compute_bev_features(
     height_mean = cell_mean[inverse]
     height_std = cell_std[inverse]
 
+    # Global normalized height: separates water (~0) from rooftops (~0.8+)
+    z_global_min, z_global_max = z.min(), z.max()
+    z_global_range = z_global_max - z_global_min
+    if z_global_range > 0:
+        z_normalized = (z - z_global_min) / z_global_range
+    else:
+        z_normalized = np.zeros_like(z)
+
+    # Height rank within cell: walls span 0→1, roofs cluster near 1.0,
+    # vegetation is scattered. Avoids division by zero for single-height cells.
+    cell_range_per_point = cell_range[inverse]
+    safe_range = np.where(cell_range_per_point > 0, cell_range_per_point, 1.0)
+    height_rank = np.where(
+        cell_range_per_point > 0,
+        height_above_ground / safe_range,
+        0.5,  # single-height cell → neutral mid-value
+    )
+
     bev_feats = np.column_stack([
         density,
         height_above_ground,
         height_range,
         height_mean,
         height_std,
+        z_normalized,
+        height_rank,
     ]).astype(np.float32)
 
     return bev_feats
@@ -107,7 +131,7 @@ def compute_bev_features_chunked(
         chunk_size: number of points to process at a time.
 
     Returns:
-        bev_feats: (N, 5) float32.
+        bev_feats: (N, 7) float32.
     """
     n = len(points)
     if n <= chunk_size:
@@ -142,8 +166,14 @@ def compute_bev_features_chunked(
             s[3] = min(s[3], cz.min())
             s[4] = max(s[4], cz.max())
 
+    # global z range for z_normalized
+    z_global_min, z_global_max = z.min(), z.max()
+    z_global_range = z_global_max - z_global_min
+    if z_global_range == 0:
+        z_global_range = 1.0
+
     # pass 2: build per-point features in chunks
-    bev_feats = np.empty((n, 5), dtype=np.float32)
+    bev_feats = np.empty((n, 7), dtype=np.float32)
 
     for start in range(0, n, chunk_size):
         end = min(start + chunk_size, n)
@@ -155,10 +185,14 @@ def compute_bev_features_chunked(
             count, z_sum, z_sq_sum, z_min, z_max = s
             mean = z_sum / count
             var = max((z_sq_sum / count) - mean * mean, 0.0)
+            h_range = z_max - z_min
+            h_above = chunk_z[i] - z_min
             bev_feats[start + i, 0] = np.log1p(count)
-            bev_feats[start + i, 1] = chunk_z[i] - z_min
-            bev_feats[start + i, 2] = z_max - z_min
+            bev_feats[start + i, 1] = h_above
+            bev_feats[start + i, 2] = h_range
             bev_feats[start + i, 3] = mean
             bev_feats[start + i, 4] = np.sqrt(var)
+            bev_feats[start + i, 5] = (chunk_z[i] - z_global_min) / z_global_range
+            bev_feats[start + i, 6] = (h_above / h_range) if h_range > 0 else 0.5
 
     return bev_feats

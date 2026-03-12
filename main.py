@@ -372,7 +372,7 @@ def count_feature_channels(
     """Calculate expected in_channels so user knows which config to use."""
     c = 6  # xyz (3) + rgb (3) — Open3D-ML convention
     if use_bev:
-        c += 5
+        c += 7
     if footprint_path:
         c += 1  # footprint_mask
     if dem_path:
