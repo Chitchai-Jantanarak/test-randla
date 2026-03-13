@@ -7,7 +7,7 @@
 set -euo pipefail
 
 SIZE="${1:-200G}"
-MOUNTPOINT="${2:-/mnt/ramdisk}"
+MOUNTPOINT="${2:-${HOME}/ramdisk}"
 
 # ── Check available RAM ───────────────────────────────────────────────────────
 AVAIL_KB=$(grep MemAvailable /proc/meminfo | awk '{print $2}')

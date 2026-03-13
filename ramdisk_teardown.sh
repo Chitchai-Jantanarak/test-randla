@@ -4,7 +4,7 @@
 
 set -euo pipefail
 
-MOUNTPOINT="${1:-/mnt/ramdisk}"
+MOUNTPOINT="${1:-${HOME}/ramdisk}"
 
 if mountpoint -q "$MOUNTPOINT"; then
     umount "$MOUNTPOINT"

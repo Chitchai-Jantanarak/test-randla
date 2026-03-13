@@ -9,27 +9,42 @@
 #   --remote     RCLONE_REMOTE   rclone remote name (required, e.g. "myremote")
 #   --src        RCLONE_SRC      Remote source path  (default: "input")
 #   --dst        RCLONE_DST      Remote output path  (default: "output")
-#   --ramdisk    RAMDISK         Ramdisk mountpoint  (default: /mnt/ramdisk)
-#   --input      INPUT_FILE      Input file name relative to ramdisk/input/
+#   --ramdisk    RAMDISK         Ramdisk mountpoint  (default: ~/ramdisk)
+#   --input      INPUT_FILE      Abs path OR bare filename under ramdisk/input/
 #   --config     CONFIG          YAML config file    (default: randlanet_toronto3d_config.yml)
 #   --device     DEVICE          cpu or cuda         (default: cuda)
 #   --chunk      CHUNK_SIZE      Chunk size in pts   (default: 500000)
 #   --bev                        Enable BEV features
-#   --footprints FOOTPRINTS      Footprint file name (relative to ramdisk/input/)
-#   --dem        DEM             DEM file name       (relative to ramdisk/input/)
-#   --dsm        DSM             DSM file name       (relative to ramdisk/input/)
+#   --footprints FOOTPRINTS      Abs path OR bare filename under ramdisk/input/
+#   --dem        DEM             Abs path OR bare filename under ramdisk/input/
+#   --dsm        DSM             Abs path OR bare filename under ramdisk/input/
 #   --no-apply                   Skip apply.py step
 #   --keep-ramdisk               Do not unmount ramdisk after run
 #
-# Example:
-#   sudo bash run_pipeline.sh \
+# --input / --footprints / --dem / --dsm accept either:
+#   • Absolute path  : /home/user/ramdisk/input/scan.laz  (used as-is)
+#   • ~/... path     : ~/ramdisk/input/scan.laz            (expanded)
+#   • Bare filename  : scan.laz  → resolved under ramdisk/input/scan.laz
+#
+# Example (bare filenames — ramdisk at ~/ramdisk):
+#   bash run_pipeline.sh \
 #       --remote gdrive \
 #       --src "LiDAR/raw" \
 #       --dst "LiDAR/classified" \
+#       --ramdisk ~/ramdisk \
 #       --input scan.laz \
 #       --bev \
 #       --footprints buildings.geojson \
 #       --dem dem.tif
+#
+# Example (absolute paths — script lives anywhere):
+#   bash ~/abc/run_pipeline.sh \
+#       --remote gdrive \
+#       --src "LiDAR/raw" \
+#       --dst "LiDAR/classified" \
+#       --input ~/ramdisk/input/scan.laz \
+#       --footprints ~/ramdisk/input/buildings.geojson \
+#       --dem ~/ramdisk/input/dem.tif
 
 set -euo pipefail
 
@@ -37,7 +52,7 @@ set -euo pipefail
 RCLONE_REMOTE="${RCLONE_REMOTE:-}"
 RCLONE_SRC="${RCLONE_SRC:-input}"
 RCLONE_DST="${RCLONE_DST:-output}"
-RAMDISK="${RAMDISK:-/mnt/ramdisk}"
+RAMDISK="${RAMDISK:-${HOME}/ramdisk}"
 INPUT_FILE="${INPUT_FILE:-}"
 CONFIG="${CONFIG:-randlanet_toronto3d_config.yml}"
 DEVICE="${DEVICE:-cuda}"
@@ -85,6 +100,20 @@ RAMDISK_IN="${RAMDISK}/input"
 RAMDISK_OUT="${RAMDISK}/output"
 RAMDISK_TMP="${RAMDISK}/tmp"
 
+# ── Path resolver ─────────────────────────────────────────────────────────────
+# If value starts with / or ~ it is used as-is (absolute).
+# Otherwise it is treated as a bare filename under ramdisk/input/.
+resolve_path() {
+    local val="$1"
+    # expand leading ~
+    val="${val/#\~/$HOME}"
+    if [[ "$val" == /* ]]; then
+        echo "$val"
+    else
+        echo "${RAMDISK_IN}/${val}"
+    fi
+}
+
 # ── Helper: timed step ────────────────────────────────────────────────────────
 step() {
     local label="$1"; shift
@@ -107,8 +136,9 @@ fi
 mkdir -p "$RAMDISK_IN" "$RAMDISK_OUT" "$RAMDISK_TMP"
 
 # ── Derived paths ─────────────────────────────────────────────────────────────
-STEM="${INPUT_FILE%.*}"          # e.g. scan.laz → scan
-INPUT_PATH="${RAMDISK_IN}/${INPUT_FILE}"
+INPUT_PATH="$(resolve_path "$INPUT_FILE")"
+BASENAME="$(basename "$INPUT_PATH")"
+STEM="${BASENAME%.*}"            # e.g. scan.laz → scan
 LABELS_PATH="${RAMDISK_OUT}/${STEM}_labels.npy"
 COLORED_PATH="${RAMDISK_OUT}/${STEM}_colored.ply"
 CLASSIFIED_PATH="${RAMDISK_OUT}/${STEM}_classified.las"
@@ -118,9 +148,9 @@ BUILDINGS_JSON="${RAMDISK_OUT}/${STEM}_buildings.json"
 FOOTPRINTS_ARG=""
 DEM_ARG=""
 DSM_ARG=""
-[[ -n "$FOOTPRINTS" ]] && FOOTPRINTS_ARG="--footprints ${RAMDISK_IN}/${FOOTPRINTS}"
-[[ -n "$DEM" ]]        && DEM_ARG="--dem ${RAMDISK_IN}/${DEM}"
-[[ -n "$DSM" ]]        && DSM_ARG="--dsm ${RAMDISK_IN}/${DSM}"
+[[ -n "$FOOTPRINTS" ]] && FOOTPRINTS_ARG="--footprints $(resolve_path "$FOOTPRINTS")"
+[[ -n "$DEM" ]]        && DEM_ARG="--dem $(resolve_path "$DEM")"
+[[ -n "$DSM" ]]        && DSM_ARG="--dsm $(resolve_path "$DSM")"
 
 # ── Python runner (uv if available, else plain python) ────────────────────────
 PY_RUN="python"
