@@ -55,18 +55,34 @@ def load_label_mapping(path: str) -> dict:
 
 
 def read_point_cloud(path: str):
-    """Read full point cloud. Returns (points, colors, source_las_or_None)."""
+    """Read full point cloud. Returns (points, colors, source_header_or_None).
+
+    For LAS/LAZ: extracts arrays and frees the laspy object to avoid
+    holding ~60 GB of duplicate data for large (2B+ point) files.
+    Returns the header (not full las) so write_classified_las can
+    preserve format info without keeping point data alive twice.
+    """
     ext = os.path.splitext(path)[1].lower()
 
     if ext in (".las", ".laz"):
         las = laspy.read(path)
-        points = np.stack([las.x, las.y, las.z], axis=-1)
+        n = las.header.point_count
+        print(f"  Allocating {n:,} points (~{n * 3 * 8 / 1e9:.1f} GB float64 xyz)")
+        points = np.empty((n, 3), dtype=np.float64)
+        points[:, 0] = las.x
+        points[:, 1] = las.y
+        points[:, 2] = las.z
         colors = np.empty((0,))
         try:
-            colors = np.stack([las.red, las.green, las.blue], axis=-1)
+            colors = np.empty((n, 3), dtype=np.uint16)
+            colors[:, 0] = las.red
+            colors[:, 1] = las.green
+            colors[:, 2] = las.blue
         except Exception:
             pass
-        return points, colors, las
+        header = las.header
+        del las  # free laspy internal buffers
+        return points, colors, header
 
     elif ext == ".ply":
         try:
@@ -112,7 +128,7 @@ def write_classified_las(
     points: np.ndarray,
     colors: np.ndarray,
     classification: np.ndarray,
-    source_las=None,
+    source_header=None,
     use_las14: bool = False,
 ):
     max_class = int(classification.max())
@@ -120,15 +136,14 @@ def write_classified_las(
         print(f"WARNING: max class {max_class} > 31; upgrading to LAS 1.4")
         use_las14 = True
 
-    if source_las is not None:
-        src_ver = f"{source_las.header.version.major}.{source_las.header.version.minor}"
-        if not (use_las14 and src_ver < "1.4"):
-            source_las.classification = classification.astype(np.uint8)
-            source_las.write(output_path)
-            return
-
     has_color = colors.size > 0
-    if use_las14:
+
+    # Try to reuse source header's point format/version when compatible
+    if source_header is not None and not use_las14:
+        src_ver = f"{source_header.version.major}.{source_header.version.minor}"
+        pf = source_header.point_format.id
+        ver = src_ver
+    elif use_las14:
         pf, ver = (7 if has_color else 6), "1.4"
     else:
         pf, ver = (2 if has_color else 0), "1.2"
@@ -291,8 +306,8 @@ def apply_labels(
     pred_labels = pred_labels.astype(np.int32).ravel()
     print(f"Loaded {len(pred_labels):,} labels (unique: {np.unique(pred_labels).tolist()})")
 
-    # load point cloud
-    points, colors, source_las = read_point_cloud(input_path)
+    # load point cloud (las object freed internally, only header kept)
+    points, colors, source_header = read_point_cloud(input_path)
     print(f"Loaded {len(points):,} points from {input_path}")
 
     if len(points) != len(pred_labels):
@@ -317,7 +332,7 @@ def apply_labels(
         print(f"  ASPRS {c:3d}  →  {n:>12,} points")
 
     # ---- write classified LAS ----
-    write_classified_las(output_path, points, colors, classification, source_las, use_las14)
+    write_classified_las(output_path, points, colors, classification, source_header, use_las14)
     print(f"\nSaved classified LAS → {output_path}")
 
     # ---- building counting ----

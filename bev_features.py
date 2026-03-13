@@ -56,20 +56,23 @@ def compute_bev_features(
     cell_z_min = np.full(n_cells, np.inf)
     cell_z_max = np.full(n_cells, -np.inf)
 
-    # min/max per cell (vectorized via sort trick)
+    # min/max per cell — vectorized via np.minimum/maximum.reduceat
     order = np.argsort(inverse)
     sorted_inv = inverse[order]
     sorted_z = z[order]
 
-    # find first and last index per cell
     boundaries = np.searchsorted(sorted_inv, np.arange(n_cells), side="left")
     boundaries_right = np.searchsorted(sorted_inv, np.arange(n_cells), side="right")
 
-    for i in range(n_cells):
-        lo, hi = boundaries[i], boundaries_right[i]
-        if lo < hi:
-            cell_z_min[i] = sorted_z[lo:hi].min()
-            cell_z_max[i] = sorted_z[lo:hi].max()
+    # Use reduceat for vectorized min/max (avoids Python loop over n_cells)
+    cell_z_min = np.minimum.reduceat(sorted_z, boundaries)
+    cell_z_max = np.maximum.reduceat(sorted_z, boundaries)
+    # Handle empty cells (shouldn't happen with unique, but be safe)
+    empty = boundaries >= boundaries_right
+    cell_z_min[empty] = 0.0
+    cell_z_max[empty] = 0.0
+
+    del order, sorted_inv, sorted_z, boundaries, boundaries_right  # free sort buffers
 
     # per-cell stats
     cell_mean = cell_z_sum / np.maximum(cell_count, 1)
@@ -77,40 +80,35 @@ def compute_bev_features(
     cell_std = np.sqrt(np.maximum(cell_var, 0.0))
     cell_range = cell_z_max - cell_z_min
 
-    # map back to per-point
-    density = np.log1p(cell_count[inverse])  # log-scaled density
-    height_above_ground = z - cell_z_min[inverse]
-    height_range = cell_range[inverse]
-    height_mean = cell_mean[inverse]
-    height_std = cell_std[inverse]
+    del cell_z_sum, cell_z_sq_sum, cell_z_max  # free cell accumulators
 
-    # Global normalized height: separates water (~0) from rooftops (~0.8+)
+    # Global z range for normalization
     z_global_min, z_global_max = z.min(), z.max()
     z_global_range = z_global_max - z_global_min
-    if z_global_range > 0:
-        z_normalized = (z - z_global_min) / z_global_range
-    else:
-        z_normalized = np.zeros_like(z)
+    if z_global_range == 0:
+        z_global_range = 1.0
 
-    # Height rank within cell: walls span 0→1, roofs cluster near 1.0,
-    # vegetation is scattered. Avoids division by zero for single-height cells.
-    cell_range_per_point = cell_range[inverse]
-    safe_range = np.where(cell_range_per_point > 0, cell_range_per_point, 1.0)
-    height_rank = np.where(
-        cell_range_per_point > 0,
-        height_above_ground / safe_range,
-        0.5,  # single-height cell → neutral mid-value
+    # Write directly into output array — avoids 7 intermediate N-sized float64 arrays
+    # (saves ~112 GB for 2B points)
+    n = len(inverse)
+    bev_feats = np.empty((n, 7), dtype=np.float32)
+
+    bev_feats[:, 0] = np.log1p(cell_count[inverse])                      # density
+    bev_feats[:, 1] = z - cell_z_min[inverse]                            # height_above_ground
+    bev_feats[:, 2] = cell_range[inverse]                                # height_range
+    bev_feats[:, 3] = cell_mean[inverse]                                 # height_mean
+    bev_feats[:, 4] = cell_std[inverse]                                  # height_std
+    bev_feats[:, 5] = ((z - z_global_min) / z_global_range).astype(np.float32)  # z_normalized
+
+    # Height rank: walls span 0→1, roofs cluster near 1.0
+    cell_range_pp = cell_range[inverse]
+    safe_range = np.where(cell_range_pp > 0, cell_range_pp, 1.0)
+    bev_feats[:, 6] = np.where(
+        cell_range_pp > 0,
+        bev_feats[:, 1] / safe_range,  # reuse height_above_ground column
+        0.5,
     )
-
-    bev_feats = np.column_stack([
-        density,
-        height_above_ground,
-        height_range,
-        height_mean,
-        height_std,
-        z_normalized,
-        height_rank,
-    ]).astype(np.float32)
+    del cell_range_pp, safe_range
 
     return bev_feats
 

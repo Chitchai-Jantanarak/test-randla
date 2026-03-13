@@ -267,13 +267,20 @@ def read_pointcloud(path: str, chunk_size: int = 0):
         if laspy is None:
             sys.exit("laspy is required.  pip install laspy")
         las = laspy.read(path)
-        pts = np.stack([las.x, las.y, las.z], axis=-1).astype(np.float32)
+        n = las.header.point_count
+        print(f"LAS file: {n:,} points, loading all at once (~{n * 3 * 4 / 1e9:.1f} GB for xyz float32)")
+        pts = np.empty((n, 3), dtype=np.float32)
+        pts[:, 0] = las.x
+        pts[:, 1] = las.y
+        pts[:, 2] = las.z
         try:
-            colors = np.stack([
-                las.red / 256.0, las.green / 256.0, las.blue / 256.0
-            ], axis=-1).astype(np.float32)
+            colors = np.empty((n, 3), dtype=np.float32)
+            colors[:, 0] = las.red / 256.0
+            colors[:, 1] = las.green / 256.0
+            colors[:, 2] = las.blue / 256.0
         except Exception:
-            colors = np.zeros_like(pts)
+            colors = np.zeros((n, 3), dtype=np.float32)
+        del las  # free laspy internal buffers (~60 GB for 2B points)
         return [(pts, colors)]
 
     else:
