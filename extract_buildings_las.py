@@ -12,6 +12,7 @@ Usage:
 """
 
 import sys
+import os
 import json
 import argparse
 import numpy as np
@@ -20,6 +21,12 @@ try:
     import laspy
 except ImportError:
     sys.exit("laspy is required.  Install with:  pip install laspy")
+
+
+def _ensure_parent_dir(path: str) -> None:
+    """Create the parent directory of *path* if it does not already exist."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
 
 
 def bbox_corners(bbox_min, bbox_max):
@@ -79,6 +86,7 @@ def buildings_to_las(buildings, output_path, class_id=6):
     las.intensity = all_intensity
     las.classification = all_classification
 
+    _ensure_parent_dir(output_path)
     las.write(output_path)
     return len(all_points)
 

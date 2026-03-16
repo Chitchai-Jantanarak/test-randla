@@ -60,6 +60,16 @@ PRETRAINED_IN_CHANNELS = 6
 
 
 # ---------------------------------------------------------------------------
+# I/O helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_parent_dir(path: str) -> None:
+    """Create the parent directory of *path* if it does not already exist."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+
+# ---------------------------------------------------------------------------
 # Weight management
 # ---------------------------------------------------------------------------
 
@@ -446,6 +456,7 @@ def process_pointcloud(
     print(f"Inference done: {len(all_labels):,} points total")
 
     # save labels
+    _ensure_parent_dir(output_labels)
     np.save(output_labels, all_labels)
     print(f"Saved labels → {output_labels}")
 
@@ -459,6 +470,7 @@ def process_pointcloud(
         norm = all_labels / max_label if max_label > 0 else all_labels.astype(float)
         pcd.colors = o3d.utility.Vector3dVector(np.stack([norm] * 3, axis=1))
 
+        _ensure_parent_dir(output_ply)
         o3d.io.write_point_cloud(output_ply, pcd)
         print(f"Saved colored PLY → {output_ply}")
 

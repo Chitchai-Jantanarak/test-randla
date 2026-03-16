@@ -43,6 +43,12 @@ CLASS_VEGETATION = 2
 CLASS_UNLABELED = -1
 
 
+def _ensure_parent_dir(path: str) -> None:
+    """Create the parent directory of *path* if it does not already exist."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+
 # ---------------------------------------------------------------------------
 # Point cloud loading
 # ---------------------------------------------------------------------------
@@ -165,6 +171,7 @@ if __name__ == "__main__":
         min_building_height=args.min_building_height,
     )
 
+    _ensure_parent_dir(args.output)
     np.save(args.output, labels)
     print(f"\nSaved auto-labels → {args.output}")
     print(f"Ready for training: use as ground truth with fine-tuning pipeline")
