@@ -54,6 +54,12 @@ def load_label_mapping(path: str) -> dict:
     return {int(k): int(v) for k, v in raw.items()}
 
 
+def _ensure_parent_dir(path: str) -> None:
+    """Create the parent directory of *path* if it does not already exist."""
+    parent = os.path.dirname(os.path.abspath(path))
+    os.makedirs(parent, exist_ok=True)
+
+
 def read_point_cloud(path: str):
     """Read full point cloud. Returns (points, colors, source_header_or_None).
 
@@ -131,6 +137,8 @@ def write_classified_las(
     source_header=None,
     use_las14: bool = False,
 ):
+    _ensure_parent_dir(output_path)
+
     max_class = int(classification.max())
     if max_class > 31 and not use_las14:
         print(f"WARNING: max class {max_class} > 31; upgrading to LAS 1.4")
@@ -359,6 +367,8 @@ def apply_labels(
     if building_json_path is None:
         building_json_path = os.path.splitext(output_path)[0] + "_buildings.json"
 
+    _ensure_parent_dir(building_json_path)
+
     output_data = {
         "source_file": os.path.basename(input_path),
         "total_points": len(points),
@@ -507,6 +517,8 @@ def apply_labels_chunked(
     # save report
     if building_json_path is None:
         building_json_path = os.path.splitext(output_path)[0] + "_buildings.json"
+
+    _ensure_parent_dir(building_json_path)
 
     output_data = {
         "source_file": os.path.basename(input_path),
