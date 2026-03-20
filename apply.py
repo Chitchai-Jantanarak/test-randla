@@ -24,6 +24,20 @@ except ImportError:
 from sklearn.cluster import DBSCAN
 from sklearn.neighbors import NearestNeighbors
 
+from bev_features import compute_bev_features
+
+
+# ---------------------------------------------------------------------------
+# BEV channel indices (must match bev_features.py output order)
+# ---------------------------------------------------------------------------
+BEV_DENSITY = 0
+BEV_HEIGHT_ABOVE_GROUND = 1
+BEV_HEIGHT_RANGE = 2
+BEV_HEIGHT_MEAN = 3
+BEV_HEIGHT_STD = 4
+BEV_Z_NORMALIZED = 5
+BEV_HEIGHT_RANK = 6
+
 
 # ---------------------------------------------------------------------------
 # Label mapping: Toronto3D model class → ASPRS LAS classification
@@ -179,6 +193,65 @@ def estimate_ground_z(points_z: np.ndarray, percentile: float = 5.0) -> float:
     return np.percentile(points_z, percentile)
 
 
+def _validate_cluster_bev(
+    cluster_bev: np.ndarray,
+    scene_median_density: float,
+    min_height_above_ground: float = 2.5,
+    min_height_range: float = 2.0,
+    min_height_rank: float = 0.5,
+    min_footprint_area: float = 15.0,
+    cluster_pts_xy: np.ndarray | None = None,
+) -> tuple[bool, dict]:
+    """Score a DBSCAN cluster using BEV feature statistics.
+
+    Args:
+        cluster_bev: (M, 7) BEV features for points in this cluster.
+        scene_median_density: median density across all points (for comparison).
+        min_height_above_ground: reject clusters whose median local height is below this.
+        min_height_range: reject clusters with median cell height_range below this.
+        min_height_rank: reject clusters whose median height_rank is below this.
+        min_footprint_area: reject clusters whose XY footprint area is below this (m²).
+        cluster_pts_xy: (M, 2) xy coordinates for footprint area calculation.
+
+    Returns:
+        (is_valid, stats_dict) — whether cluster passes, and diagnostic stats.
+    """
+    med_hag = float(np.median(cluster_bev[:, BEV_HEIGHT_ABOVE_GROUND]))
+    med_hrange = float(np.median(cluster_bev[:, BEV_HEIGHT_RANGE]))
+    med_hrank = float(np.median(cluster_bev[:, BEV_HEIGHT_RANK]))
+    med_density = float(np.median(cluster_bev[:, BEV_DENSITY]))
+    med_hstd = float(np.median(cluster_bev[:, BEV_HEIGHT_STD]))
+
+    # XY footprint area (bounding box)
+    footprint_area = 0.0
+    if cluster_pts_xy is not None and len(cluster_pts_xy) > 1:
+        xy_min = cluster_pts_xy.min(axis=0)
+        xy_max = cluster_pts_xy.max(axis=0)
+        footprint_area = float((xy_max[0] - xy_min[0]) * (xy_max[1] - xy_min[1]))
+
+    stats = {
+        "median_height_above_ground": round(med_hag, 2),
+        "median_height_range": round(med_hrange, 2),
+        "median_height_rank": round(med_hrank, 3),
+        "median_density": round(med_density, 2),
+        "median_height_std": round(med_hstd, 2),
+        "footprint_area_m2": round(footprint_area, 1),
+    }
+
+    # Rejection criteria — any failure rejects
+    is_valid = True
+    if med_hag < min_height_above_ground:
+        is_valid = False
+    if med_hrange < min_height_range:
+        is_valid = False
+    if med_hrank < min_height_rank:
+        is_valid = False
+    if footprint_area < min_footprint_area:
+        is_valid = False
+
+    return is_valid, stats
+
+
 def count_buildings(
     points: np.ndarray,
     pred_labels: np.ndarray,
@@ -187,20 +260,28 @@ def count_buildings(
     dbscan_eps: float | None = None,
     dbscan_min_samples: int = 50,
     min_building_points: int = 200,
+    bev_features: np.ndarray | None = None,
+    bev_cell_size: float = 1.0,
 ) -> dict:
     """Cluster building points and return count + per-building bounding boxes.
 
+    When *bev_features* is provided (or computed via --bev), uses per-cell
+    local height_above_ground instead of a single global ground percentile,
+    and validates each cluster using BEV statistics (height_range, height_rank,
+    density, footprint area).
+
     Steps:
         1. Filter to building class only
-        2. Height filter: discard points too close to ground (removes cars, ground noise)
+        2. Height filter using BEV local ground (or global percentile fallback)
         3. Project to 2D (xy) to avoid z-axis fragmentation
         4. Adaptive DBSCAN eps if not provided
-        5. Filter small clusters (noise)
-        6. Compute 3D bounding box per cluster
+        5. DBSCAN clustering
+        6. Validate each cluster with BEV statistics (or point-count-only fallback)
+        7. Compute 3D bounding box per surviving cluster
 
     Returns dict with:
         - building_count: int
-        - buildings: list of {id, point_count, bbox_min, bbox_max, centroid}
+        - buildings: list of {id, point_count, bbox_min, bbox_max, centroid, bev_stats}
         - cluster_labels: np.ndarray same length as input, -1 for non-building
     """
     n = len(points)
@@ -208,23 +289,48 @@ def count_buildings(
 
     # step 1: building mask
     building_mask = pred_labels == building_class
-    building_count_raw = building_mask.sum()
+    building_count_raw = int(building_mask.sum())
     if building_count_raw == 0:
         return {"building_count": 0, "buildings": [], "cluster_labels": cluster_labels}
 
     building_points = points[building_mask]
-    building_z = building_points[:, 2]
 
-    # step 2: height filter — remove points near ground level
-    ground_z = estimate_ground_z(points[:, 2])  # use ALL points for ground estimate
-    height_mask = building_z > (ground_z + min_height_above_ground)
+    # ---------- BEV path vs legacy path ----------
+    use_bev = bev_features is not None
 
-    if height_mask.sum() == 0:
-        return {"building_count": 0, "buildings": [], "cluster_labels": cluster_labels}
+    if use_bev:
+        building_bev = bev_features[building_mask]  # (M, 7)
 
-    filtered_points = building_points[height_mask]
-    print(f"  Building points: {building_count_raw:,} raw → {len(filtered_points):,} after height filter "
-          f"(ground_z={ground_z:.1f}, threshold=+{min_height_above_ground:.1f}m)")
+        # step 2 (BEV): use per-cell height_above_ground for filtering
+        local_hag = building_bev[:, BEV_HEIGHT_ABOVE_GROUND]
+        height_mask = local_hag > min_height_above_ground
+
+        if height_mask.sum() == 0:
+            return {"building_count": 0, "buildings": [], "cluster_labels": cluster_labels}
+
+        filtered_points = building_points[height_mask]
+        filtered_bev = building_bev[height_mask]
+
+        # scene-wide median density for relative comparison
+        scene_median_density = float(np.median(bev_features[:, BEV_DENSITY]))
+
+        print(f"  Building points (BEV): {building_count_raw:,} raw → {len(filtered_points):,} "
+              f"after local height filter (threshold=+{min_height_above_ground:.1f}m)")
+    else:
+        # legacy path: global ground estimate
+        building_z = building_points[:, 2]
+        ground_z = estimate_ground_z(points[:, 2])
+        height_mask = building_z > (ground_z + min_height_above_ground)
+
+        if height_mask.sum() == 0:
+            return {"building_count": 0, "buildings": [], "cluster_labels": cluster_labels}
+
+        filtered_points = building_points[height_mask]
+        filtered_bev = None
+        scene_median_density = 0.0
+
+        print(f"  Building points: {building_count_raw:,} raw → {len(filtered_points):,} after height filter "
+              f"(ground_z={ground_z:.1f}, threshold=+{min_height_above_ground:.1f}m)")
 
     # step 3: project to 2D for clustering
     xy = filtered_points[:, :2]
@@ -242,8 +348,9 @@ def count_buildings(
     clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(xy)
     raw_labels = clustering.labels_
 
-    # step 6: filter small clusters and build results
+    # step 6: filter clusters and build results
     buildings = []
+    rejected = 0
     unique_labels = set(raw_labels)
     unique_labels.discard(-1)
 
@@ -254,28 +361,54 @@ def count_buildings(
     bid = 0
     for label in sorted(unique_labels):
         cluster_mask = raw_labels == label
-        if cluster_mask.sum() < min_building_points:
+        count = int(cluster_mask.sum())
+        if count < min_building_points:
             continue
 
         cluster_pts = filtered_points[cluster_mask]
+
+        # BEV validation
+        if use_bev and filtered_bev is not None:
+            cluster_bev = filtered_bev[cluster_mask]
+            is_valid, bev_stats = _validate_cluster_bev(
+                cluster_bev,
+                scene_median_density,
+                min_height_above_ground=min_height_above_ground,
+                cluster_pts_xy=cluster_pts[:, :2],
+            )
+            if not is_valid:
+                rejected += 1
+                continue
+        else:
+            bev_stats = {}
+
         bbox_min = cluster_pts.min(axis=0).tolist()
         bbox_max = cluster_pts.max(axis=0).tolist()
         centroid = cluster_pts.mean(axis=0).tolist()
 
-        buildings.append({
+        building_info = {
             "id": bid,
-            "point_count": int(cluster_mask.sum()),
+            "point_count": count,
             "bbox_min": bbox_min,
             "bbox_max": bbox_max,
             "centroid": centroid,
-        })
+        }
+        if bev_stats:
+            building_info["bev_stats"] = bev_stats
+
+        buildings.append(building_info)
 
         # write cluster ID back to full-size label array
         original_indices = building_indices[height_indices[cluster_mask]]
         cluster_labels[original_indices] = bid
         bid += 1
 
-    print(f"  Buildings found: {len(buildings)} (after filtering clusters < {min_building_points} pts)")
+    if use_bev:
+        print(f"  Buildings found: {len(buildings)} "
+              f"(rejected {rejected} by BEV validation, "
+              f"filtered clusters < {min_building_points} pts)")
+    else:
+        print(f"  Buildings found: {len(buildings)} (after filtering clusters < {min_building_points} pts)")
 
     return {
         "building_count": len(buildings),
@@ -299,6 +432,8 @@ def apply_labels(
     dbscan_eps: float | None = None,
     dbscan_min_samples: int = 50,
     min_building_points: int = 200,
+    use_bev: bool = False,
+    bev_cell_size: float = 1.0,
 ):
     label_map = mapping if mapping is not None else DEFAULT_LABEL_MAP
 
@@ -343,6 +478,13 @@ def apply_labels(
     write_classified_las(output_path, points, colors, classification, source_header, use_las14)
     print(f"\nSaved classified LAS → {output_path}")
 
+    # ---- compute BEV features for building validation ----
+    bev_feats = None
+    if use_bev:
+        print("\nComputing BEV features for building validation...")
+        bev_feats = compute_bev_features(points, cell_size=bev_cell_size)
+        print(f"  BEV features: {bev_feats.shape} (7 channels per point)")
+
     # ---- building counting ----
     print("\n--- Building Counting ---")
     result = count_buildings(
@@ -352,6 +494,8 @@ def apply_labels(
         dbscan_eps=dbscan_eps,
         dbscan_min_samples=dbscan_min_samples,
         min_building_points=min_building_points,
+        bev_features=bev_feats,
+        bev_cell_size=bev_cell_size,
     )
 
     print(f"\n  Total buildings detected: {result['building_count']}")
@@ -404,6 +548,8 @@ def apply_labels_chunked(
     dbscan_eps: float | None = None,
     dbscan_min_samples: int = 50,
     min_building_points: int = 200,
+    use_bev: bool = False,
+    bev_cell_size: float = 1.0,
 ):
     """Process huge files: stream-classify in chunks, accumulate building points
     separately for final DBSCAN pass.
@@ -469,48 +615,33 @@ def apply_labels_chunked(
     write_classified_las(output_path, all_points, all_colors, all_classification)
     print(f"Saved classified LAS → {output_path}")
 
-    # pass 2: DBSCAN on building points
+    # pass 2: DBSCAN on building points (delegate to count_buildings)
     print("\n--- Building Counting (chunked) ---")
     if building_xyz_chunks:
         all_building_xyz = np.concatenate(building_xyz_chunks)
         all_building_indices = np.concatenate(building_index_chunks)
 
-        # height filter
-        ground_z = np.percentile(all_points[:, 2], 5)
-        height_mask = all_building_xyz[:, 2] > (ground_z + min_height)
+        # Build a pseudo full-points/labels array for count_buildings
+        # We only need building points + their labels for the function
+        n_bld = len(all_building_xyz)
+        pseudo_labels = np.full(n_bld, BUILDING_MODEL_CLASS, dtype=np.int32)
 
-        filtered_xyz = all_building_xyz[height_mask]
-        print(f"  Building points: {len(all_building_xyz):,} → {len(filtered_xyz):,} after height filter")
+        bev_feats = None
+        if use_bev:
+            print("  Computing BEV features on building points...")
+            bev_feats = compute_bev_features(all_building_xyz, cell_size=bev_cell_size)
 
-        if len(filtered_xyz) > 0:
-            xy = filtered_xyz[:, :2]
-
-            if dbscan_eps is None:
-                nn = NearestNeighbors(n_neighbors=min(20, len(xy)))
-                nn.fit(xy)
-                distances, _ = nn.kneighbors(xy)
-                dbscan_eps = max(float(np.percentile(distances[:, -1], 90)), 0.5)
-                print(f"  Adaptive DBSCAN eps = {dbscan_eps:.2f}m")
-
-            clustering = DBSCAN(eps=dbscan_eps, min_samples=dbscan_min_samples).fit(xy)
-
-            buildings = []
-            for label in sorted(set(clustering.labels_) - {-1}):
-                cm = clustering.labels_ == label
-                if cm.sum() < min_building_points:
-                    continue
-                cpts = filtered_xyz[cm]
-                buildings.append({
-                    "id": len(buildings),
-                    "point_count": int(cm.sum()),
-                    "bbox_min": cpts.min(axis=0).tolist(),
-                    "bbox_max": cpts.max(axis=0).tolist(),
-                    "centroid": cpts.mean(axis=0).tolist(),
-                })
-
-            print(f"  Buildings found: {len(buildings)}")
-        else:
-            buildings = []
+        result = count_buildings(
+            all_building_xyz, pseudo_labels,
+            building_class=BUILDING_MODEL_CLASS,
+            min_height_above_ground=min_height,
+            dbscan_eps=dbscan_eps,
+            dbscan_min_samples=dbscan_min_samples,
+            min_building_points=min_building_points,
+            bev_features=bev_feats,
+            bev_cell_size=bev_cell_size,
+        )
+        buildings = result["buildings"]
     else:
         buildings = []
 
@@ -562,6 +693,13 @@ if __name__ == "__main__":
     parser.add_argument("--min-building-points", type=int, default=200,
                         help="Min points per building cluster")
 
+    # BEV-enhanced building validation
+    parser.add_argument("--bev", action="store_true",
+                        help="Use BEV features for building validation (local ground, "
+                             "height_range, height_rank, density checks per cluster)")
+    parser.add_argument("--bev-cell-size", type=float, default=1.0,
+                        help="BEV grid cell size in meters (default: 1.0)")
+
     # chunked mode
     parser.add_argument("--chunk-size", type=int, default=0,
                         help="Chunk size for large files (0 = load all). Recommended: 5000000")
@@ -584,6 +722,8 @@ if __name__ == "__main__":
             dbscan_eps=args.dbscan_eps,
             dbscan_min_samples=args.dbscan_min_samples,
             min_building_points=args.min_building_points,
+            use_bev=args.bev,
+            bev_cell_size=args.bev_cell_size,
         )
     else:
         apply_labels(
@@ -597,4 +737,6 @@ if __name__ == "__main__":
             dbscan_eps=args.dbscan_eps,
             dbscan_min_samples=args.dbscan_min_samples,
             min_building_points=args.min_building_points,
+            use_bev=args.bev,
+            bev_cell_size=args.bev_cell_size,
         )
