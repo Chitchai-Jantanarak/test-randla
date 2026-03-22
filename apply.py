@@ -184,6 +184,26 @@ def write_classified_las(
     las.write(output_path)
 
 
+def write_classified_las_inplace(
+    input_path: str,
+    output_path: str,
+    classification: np.ndarray,
+):
+    """Re-read the source LAS, overwrite only the classification field, and
+    write to *output_path*.  Preserves ALL original fields (intensity,
+    return number, GPS time, NIR, etc.) so the output size matches the input.
+    """
+    _ensure_parent_dir(output_path)
+    print(f"  Re-reading source LAS to preserve all fields...")
+    las = laspy.read(input_path)
+    if len(las.points) != len(classification):
+        sys.exit(f"Mismatch: {len(las.points):,} points in LAS vs "
+                 f"{len(classification):,} classification labels")
+    las.classification = classification.astype(np.uint8)
+    las.write(output_path)
+    del las
+
+
 # ---------------------------------------------------------------------------
 # Building counting via DBSCAN on 2D (xy) projection
 # ---------------------------------------------------------------------------
@@ -474,8 +494,8 @@ def apply_labels(
     for c, n in zip(unique_cls, counts):
         print(f"  ASPRS {c:3d}  →  {n:>12,} points")
 
-    # ---- write classified LAS ----
-    write_classified_las(output_path, points, colors, classification, source_header, use_las14)
+    # ---- write classified LAS (preserve all original fields) ----
+    write_classified_las_inplace(input_path, output_path, classification)
     print(f"\nSaved classified LAS → {output_path}")
 
     # ---- compute BEV features for building validation ----
@@ -604,15 +624,14 @@ def apply_labels_chunked(
         print(f"  chunk {chunk_idx}: {n:,} pts classified, "
               f"{bld_mask.sum():,} building pts collected")
 
-    # concatenate
-    all_points = np.concatenate(point_chunks)
-    all_colors = np.concatenate(color_chunks) if color_chunks else np.empty((0,))
+    # Build full classification array for in-place write
     all_classification = np.concatenate(classified_chunks)
+    all_points = np.concatenate(point_chunks)
 
     print(f"\nTotal: {len(all_points):,} points classified")
 
-    # write LAS
-    write_classified_las(output_path, all_points, all_colors, all_classification)
+    # write LAS — re-read source to preserve all original fields
+    write_classified_las_inplace(input_path, output_path, all_classification)
     print(f"Saved classified LAS → {output_path}")
 
     # pass 2: DBSCAN on building points (delegate to count_buildings)
