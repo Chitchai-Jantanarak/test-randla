@@ -457,7 +457,7 @@ def process_pointcloud(
 
     # save labels
     _ensure_parent_dir(output_labels)
-    np.save(output_labels, all_labels)
+    np.save(output_labels, all_labels.astype(np.int32))
     print(f"Saved labels → {output_labels}")
 
     # optional colored PLY
