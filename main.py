@@ -249,10 +249,13 @@ def iter_las_chunks(path: str, chunk_size: int = 5_000_000):
 
     with laspy.open(path) as reader:
         total = reader.header.point_count
-        print(f"LAS file: {total:,} points total, reading in chunks of {chunk_size:,}")
+        
+        min_x = reader.header.mins
+        min_y = reader.header.mins[1]
+        min_z = reader.header.mins[2]
 
         for chunk in reader.chunk_iterator(chunk_size):
-            pts = np.stack([chunk.x, chunk.y, chunk.z], axis=-1).astype(np.float32)
+            pts = np.stack([chunk.x - min_x, chunk.y - min_y, chunk.z - min_z], axis=-1).astype(np.float32)
             try:
                 colors = np.stack([
                     chunk.red / 256.0,
