@@ -18,14 +18,14 @@ model:
   batcher: DefaultBatcher
   ckpt_path: # path/to/your/checkpoint
   num_neighbors: 16
-  num_layers: 4
+  num_layers: 5
   num_points: 65536
   num_classes: 8
   ignored_label_inds: [0]
-  sub_sampling_ratio: [4, 4, 4, 4]
+  sub_sampling_ratio: [4, 4, 4, 4, 2]
   in_channels: 13
   dim_features: 8
-  d_out: [16, 64, 128, 256]
+  d_out: [16, 64, 128, 256, 512]
   dim_output: [16, 64, 128, 256, 512]
   grid_size: 0.06
   augment:
