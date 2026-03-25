@@ -2,7 +2,6 @@ dataset:
   name: Semantic3D
   dataset_path: # path/to/your/dataset
   cache_dir:./logs/cache_small3d/
-  # Replaced raw point counts with normalized inverse-frequency weights
   class_weights: [3.17, 3.25, 2.85, 4.64, 2.31, 4.83, 5.24, 5.27]
   ignored_label_inds: 
   num_points: 65536
