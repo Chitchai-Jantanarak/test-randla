@@ -3,7 +3,7 @@ dataset:
   dataset_path: # path/to/your/dataset
   cache_dir: ./logs/cache_small3d/
   class_weights: [3.17, 3.25, 2.85, 4.64, 2.31, 4.83, 5.24, 5.27]
-  ignored_label_inds: 
+  ignored_label_inds: [0]
   num_points: 65536
   test_result_folder: ./test
   use_cache: true
@@ -24,12 +24,13 @@ model:
   ignored_label_inds: [0]
   sub_sampling_ratio: [4, 4, 4, 4]
   in_channels: 13
-  dim_features: 32
+  dim_features: 8
+  d_out: [16, 64, 128, 256]
   dim_output: [16, 64, 128, 256, 512]
   grid_size: 0.06
   augment:
     recenter:
-      dim: 
+      dim: [0, 1, 2]
     normalize:
       feat:
         method: linear
@@ -56,7 +57,7 @@ pipeline:
   train_sum_dir: train_log
   val_batch_size: 2
   summary:
-    record_for:
-    max_pts:
+    record_for: []
+    max_pts: 65536
     use_reference: false
     max_outputs: 1
