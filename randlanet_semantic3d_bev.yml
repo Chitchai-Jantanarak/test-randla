@@ -21,11 +21,11 @@ model:
   num_layers: 4
   num_points: 65536
   num_classes: 8
-  ignored_label_inds: 
+  ignored_label_inds: [0]
   sub_sampling_ratio: [4, 4, 4, 4]
   in_channels: 13
   dim_features: 32
-  dim_output: 
+  dim_output: [16, 64, 128, 256, 512]
   grid_size: 0.06
   augment:
     recenter:
@@ -41,7 +41,7 @@ model:
       min_s: 0.9
       max_s: 1.1
     noise:
-      noise_std: 0.001
+      noise_std: 0.01
 
 pipeline:
   name: SemanticSegmentation
